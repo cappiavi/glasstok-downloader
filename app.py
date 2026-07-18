@@ -1235,7 +1235,7 @@ footer{margin-top:auto;padding-top:36px;text-align:center;}
   // ---------------------------------------------------------------------
   // Resolve a URL
   // ---------------------------------------------------------------------
-  async function resolveUrl(url) {
+  async function resolveUrl(url, isRetry = false) {
     if (!url || !url.trim()) { toast("Paste a TikTok link first.", "error"); return; }
     if (!looksLikeTikTokUrl(url)) {
       toast("That doesn't look like a TikTok link.", "error");
@@ -1244,7 +1244,7 @@ footer{margin-top:auto;padding-top:36px;text-align:center;}
 
     showState("loading");
     fetchBtn.disabled = true;
-    fetchBtnLabel.textContent = "Fetching…";
+    fetchBtnLabel.textContent = isRetry ? "Waking up server…" : "Fetching…";
 
     try {
       const res = await fetch("/api/resolve", {
@@ -1252,7 +1252,22 @@ footer{margin-top:auto;padding-top:36px;text-align:center;}
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: url.trim() }),
       });
-      const data = await res.json();
+
+      // On a free-tier cold start, the platform's own proxy can briefly
+      // return a plain-text "Not Found" (not JSON) before the app is fully
+      // awake. Parse defensively so that hiccup doesn't crash as an
+      // "Unexpected token" error — instead, retry once automatically.
+      const raw = await res.text();
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch (parseErr) {
+        if (!isRetry) {
+          await new Promise((r) => setTimeout(r, 1800));
+          return resolveUrl(url, true);
+        }
+        throw new Error("The server is still waking up — please tap Fetch again.");
+      }
 
       if (!res.ok || !data.ok) {
         throw new Error(data.error || "Couldn't fetch that video.");
