@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
- TikTok Downloader — a single-file, no-watermark TikTok video downloader
+ GlassTok — a single-file, no-watermark TikTok video downloader
 ================================================================================
 
 Local run:
@@ -44,8 +44,11 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse, quote
 
+import certifi
 import requests
 from flask import Flask, Response, jsonify, request, stream_with_context
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ==============================================================================
@@ -63,6 +66,10 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+)
 
 # Basic per-IP rate limits so a public deployment can't hammer the free
 # upstream providers into rate-limiting (or banning) everyone at once.
@@ -75,17 +82,28 @@ RATE_LIMIT_DOWNLOAD = (15, 300)   # 15 downloads per 5 minutes per IP
 
 # Domains we trust the download proxy to fetch from. This is a hard allowlist
 # used to stop the /api/download endpoint from being abused as an open,
-# server-side-request-forgery-capable proxy for arbitrary URLs.
+# server-side-request-forgery-capable proxy for arbitrary URLs. Kept broad
+# enough to cover every CDN edge TikTok's various regional apps hand back
+# (US, EU, SEA/SG mirrors) since a phone-copied link can resolve to any of
+# them depending on the account's region.
 ALLOWED_MEDIA_HOST_SUFFIXES = (
     "tiktokcdn.com",
     "tiktokcdn-us.com",
     "tiktokcdn-eu.com",
+    "tiktokcdn-in.com",
     "tiktokv.com",
     "tiktokv.us",
+    "tiktokv.eu",
     "muscdn.com",
+    "musemuse.cn",
     "ibyteimg.com",
+    "ibytedtos.com",
+    "byteimg.com",
     "byteoversea.com",
+    "bytedapm.com",
+    "sgpstatp.com",
     "tikwm.com",
+    "tiklydown.eu.org",
     "tiktok.com",
 )
 
@@ -104,6 +122,47 @@ app.config["MAX_CONTENT_LENGTH"] = 64 * 1024  # requests to this app are tiny JS
 # real client IP/scheme arrive via X-Forwarded-* headers. ProxyFix makes
 # request.remote_addr trustworthy again, which the rate limiter below relies on.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+
+# ==============================================================================
+# HTTP session — shared, retrying, certificate-pinned
+# ==============================================================================
+# A single tuned requests.Session replaces the old bare `requests.get(...)`
+# calls scattered through the file. Three things were causing the "works on
+# PC, SSLError on phone" bug reported in the field, and all three are fixed
+# here at the source instead of being patched per-call:
+#
+#   1. Bare `requests` calls trust whatever CA bundle the OS image ships
+#      with. Minimal container images (the kind free-tier hosts use) can
+#      ship a stale bundle that is missing an intermediate certificate for
+#      one of TikTok's several CDN edges — mobile share links very often
+#      resolve to a *different* regional edge than desktop web links do,
+#      which is exactly why the failure looked device-specific. Pinning to
+#      `certifi`'s bundle (kept current by pip, independent of the OS)
+#      fixes the mismatch outright.
+#   2. No retry/backoff meant a single transient TLS handshake hiccup was
+#      fatal. The adapter below retries idempotent requests automatically.
+#   3. Every short-link redirect had to succeed *before* we even tried a
+#      provider. Providers can usually resolve short links themselves
+#      server-side, so resolve_video() below now tries providers with the
+#      original URL first and only attempts our own redirect-following as
+#      a secondary enhancement — wrapped so it can never take the whole
+#      request down if it fails.
+SESSION = requests.Session()
+_retry_policy = Retry(
+    total=2,
+    connect=2,
+    read=2,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(("GET", "POST", "HEAD")),
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retry_policy, pool_maxsize=20, pool_connections=20)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+SESSION.verify = certifi.where()
+SESSION.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
 
 
 # ==============================================================================
@@ -248,22 +307,56 @@ def rate_limited(scope: str, max_calls: int, window_seconds: int):
 # ==============================================================================
 # URL validation & normalisation
 # ==============================================================================
+# Mobile share sheets are messy. iOS/Android TikTok can hand back any of:
+#   https://www.tiktok.com/@user/video/7123456789012345678?_r=1&_t=abcd
+#   https://vm.tiktok.com/ZMxxxxxxx/
+#   https://vt.tiktok.com/ZSxxxxxxx/
+#   https://www.tiktok.com/t/ZTxxxxxxx/          <- newer short-link path
+#   m.tiktok.com/v/7123456789012345678.html
+# ...sometimes with leading/trailing whitespace, a "Check out this TikTok"
+# caption glued on from a native share sheet, or no https:// scheme at all
+# because the user long-pressed and copied plain text. We handle all of it
+# by pulling the URL out of whatever text arrives instead of demanding an
+# exact match.
 
-TIKTOK_HOST_PATTERN = re.compile(
-    r"^(?:www\.|vm\.|vt\.|m\.)?tiktok\.com$", re.IGNORECASE
+_TIKTOK_URL_RE = re.compile(
+    r"https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/\S+",
+    re.IGNORECASE,
 )
-
-TIKTOK_URL_HINT = re.compile(
-    r"tiktok\.com/(?:@[\w.\-]+/video/\d+|v/\d+|t/\w+|\S+)", re.IGNORECASE
+_TIKTOK_BARE_RE = re.compile(
+    r"(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/\S+",
+    re.IGNORECASE,
 )
+_TRAILING_PUNCT = ".,;:!?)]}\"'”’"
+
+SHORT_LINK_HOSTS = ("vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com")
 
 
-def is_probably_tiktok_url(raw: str) -> bool:
-    """Cheap, fast sanity check before we spend a network round trip."""
-    if not raw or len(raw) > 2048:
+def extract_tiktok_url(raw: str) -> Optional[str]:
+    """Pull a usable TikTok URL out of arbitrary pasted text. Returns None
+    if nothing that looks like a TikTok link is present."""
+    if not raw:
+        return None
+    text = raw.strip()
+    if len(text) > 4096:
+        text = text[:4096]
+
+    match = _TIKTOK_URL_RE.search(text)
+    if match:
+        return match.group(0).rstrip(_TRAILING_PUNCT)
+
+    bare = _TIKTOK_BARE_RE.search(text)
+    if bare:
+        return "https://" + bare.group(0).rstrip(_TRAILING_PUNCT)
+
+    return None
+
+
+def is_valid_tiktok_url(url: str) -> bool:
+    if not url or len(url) > 2048:
         return False
     try:
-        parsed = urlparse(raw.strip())
+        parsed = urlparse(url)
     except ValueError:
         return False
     if parsed.scheme not in ("http", "https"):
@@ -272,25 +365,36 @@ def is_probably_tiktok_url(raw: str) -> bool:
     return host.endswith("tiktok.com")
 
 
+def is_short_link(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    if host in SHORT_LINK_HOSTS:
+        return True
+    # The /t/XXXXXXX short path lives on the main www.tiktok.com host.
+    path = urlparse(url).path or ""
+    return bool(re.match(r"^/t/[\w-]+/?$", path))
+
+
 def resolve_short_link(url: str) -> str:
     """
-    Short links (vm.tiktok.com/..., vt.tiktok.com/...) redirect to the full
-    canonical URL. We follow redirects manually (HEAD, falling back to GET)
-    so we can validate the final host before trusting it.
+    Short links redirect to the full canonical URL. We follow redirects
+    manually (HEAD, falling back to GET) so we can validate the final host
+    before trusting it. This is only ever used as a *secondary* enhancement
+    — providers are always tried with the original short URL first — so any
+    failure here (including SSL errors on a particular CDN edge) is caught
+    by the caller and simply ignored rather than surfaced to the user.
     """
     try:
-        resp = requests.head(
+        resp = SESSION.head(
             url,
-            headers={"User-Agent": USER_AGENT},
+            headers={"User-Agent": MOBILE_USER_AGENT},
             allow_redirects=True,
             timeout=REQUEST_TIMEOUT,
         )
         final_url = resp.url
         if resp.status_code >= 400 or final_url == url:
-            # Some CDNs reject HEAD requests; retry with a lightweight GET.
-            resp = requests.get(
+            resp = SESSION.get(
                 url,
-                headers={"User-Agent": USER_AGENT},
+                headers={"User-Agent": MOBILE_USER_AGENT},
                 allow_redirects=True,
                 timeout=REQUEST_TIMEOUT,
                 stream=True,
@@ -313,17 +417,20 @@ def sanitize_filename(name: str, fallback: str = "tiktok_video") -> str:
 
 # ==============================================================================
 # Providers — each knows how to turn a TikTok URL into a VideoInfo.
-# If one fails (network error, schema change, rate limit) the caller moves on
-# to the next provider automatically.
+# If one fails (network error, schema change, rate limit, SSL hiccup on a
+# particular CDN edge, missing optional dependency, anything) the caller
+# moves on to the next provider automatically. Three independent providers
+# means a single upstream having a bad day never takes the whole app down.
 # ==============================================================================
 
 def _provider_tikwm(url: str) -> VideoInfo:
-    """Primary provider: tikwm.com public JSON API. No key required."""
+    """Primary provider: tikwm.com public JSON API. No key required. Accepts
+    every TikTok URL shape (full, short, /t/) and resolves server-side, so
+    it does not depend on our own redirect-following at all."""
     api_url = "https://www.tikwm.com/api/"
-    resp = requests.post(
+    resp = SESSION.post(
         api_url,
         data={"url": url, "hd": 1},
-        headers={"User-Agent": USER_AGENT},
         timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
@@ -367,12 +474,11 @@ def _provider_tikwm(url: str) -> VideoInfo:
 
 
 def _provider_tiklydown(url: str) -> VideoInfo:
-    """Fallback provider: tiklydown public JSON API. No key required."""
+    """Fallback #1: tiklydown public JSON API. No key required."""
     api_url = "https://api.tiklydown.eu.org/api/download"
-    resp = requests.get(
+    resp = SESSION.get(
         api_url,
         params={"url": url},
-        headers={"User-Agent": USER_AGENT},
         timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
@@ -411,53 +517,126 @@ def _provider_tiklydown(url: str) -> VideoInfo:
     )
 
 
-PROVIDERS = (_provider_tikwm, _provider_tiklydown)
+def _provider_ytdlp(url: str) -> VideoInfo:
+    """Fallback #2: yt-dlp's built-in TikTok extractor. This is the most
+    resilient of the three because it's actively maintained against
+    TikTok's own site changes independent of any small free API staying
+    online, and it does its own network handling rather than depending on
+    a third-party wrapper API. Imported lazily so the rest of the app
+    works even on a deploy where the dependency hasn't been installed yet."""
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise ResolveError("yt-dlp is not installed on this deployment.") from exc
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "http_headers": {"User-Agent": USER_AGENT},
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        data = ydl.extract_info(url, download=False)
+
+    if not data:
+        raise ResolveError("yt-dlp: no data returned.")
+
+    video_id = str(data.get("id") or "")
+    if not video_id:
+        raise ResolveError("yt-dlp: no video id found.")
+
+    formats = data.get("formats") or []
+    best_mp4 = None
+    for f in formats:
+        if not f.get("url"):
+            continue
+        if best_mp4 is None or (f.get("height") or 0) > (best_mp4.get("height") or 0):
+            best_mp4 = f
+
+    direct_url = data.get("url") or (best_mp4.get("url") if best_mp4 else None)
+    if not direct_url:
+        raise ResolveError("yt-dlp: could not find a playable URL.")
+
+    height = int((best_mp4 or {}).get("height") or data.get("height") or 0)
+    music_info = data.get("music") if isinstance(data.get("music"), dict) else {}
+
+    return VideoInfo(
+        video_id=video_id,
+        title=data.get("title") or data.get("description") or "",
+        author_username=data.get("uploader") or data.get("creator") or "",
+        author_nickname=data.get("uploader_id") or data.get("uploader") or "",
+        cover_url=data.get("thumbnail") or "",
+        duration=int(data.get("duration") or 0),
+        width=int((best_mp4 or {}).get("width") or data.get("width") or 0),
+        height=height,
+        no_watermark_url=direct_url,
+        hd_url=direct_url if height >= 720 else None,
+        watermark_url=None,
+        music_url=music_info.get("play_url") or music_info.get("playUrl"),
+        size_bytes=(best_mp4 or {}).get("filesize") or (best_mp4 or {}).get("filesize_approx"),
+        hd_size_bytes=None,
+        source_provider="yt-dlp",
+    )
+
+
+PROVIDERS = (_provider_tikwm, _provider_tiklydown, _provider_ytdlp)
 
 
 def resolve_video(raw_url: str) -> VideoInfo:
     """
-    Try each provider in order until one succeeds. Raises ResolveError with a
-    friendly message if every provider fails.
+    Try every provider against the URL as given first (providers resolve
+    short links server-side, so this alone covers the vast majority of
+    phone-copied links). Only if every provider fails do we attempt our own
+    redirect-following as a bonus second pass — guarded so that a failure
+    there (including an SSL hiccup hitting a particular CDN edge directly)
+    never bubbles up as a crash, it just means we fall back to the original
+    friendly error message instead.
     """
-    if not is_probably_tiktok_url(raw_url):
+    candidate = extract_tiktok_url(raw_url)
+    if not candidate or not is_valid_tiktok_url(candidate):
         raise ResolveError("That doesn't look like a TikTok link. Paste a full tiktok.com URL.")
 
-    url = raw_url.strip()
-    host = (urlparse(url).hostname or "").lower()
-
-    # Short links need to be expanded first so providers receive a canonical
-    # /@user/video/<id> URL, which is the format they understand best.
-    if host in ("vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com"):
-        try:
-            url = resolve_short_link(url)
-        except ResolveError:
-            pass  # Fall through — providers can sometimes handle short links directly.
-
+    urls_to_try = [candidate]
+    tried_manual_resolve = False
     last_error: Optional[str] = None
-    for provider in PROVIDERS:
-        try:
-            info = provider(url)
-            if not info.no_watermark_url:
-                raise ResolveError(f"{info.source_provider}: empty media URL.")
-            _cache_set(info)
-            log.info("Resolved %s via %s", info.video_id, info.source_provider)
-            return info
-        except ResolveError as exc:
-            last_error = str(exc)
-            log.warning("Provider failed: %s", exc)
-            continue
-        except requests.Timeout:
-            last_error = f"{provider.__name__} timed out."
-            log.warning(last_error)
-            continue
-        except requests.RequestException as exc:
-            last_error = f"{provider.__name__} network error: {exc.__class__.__name__}."
-            log.warning(last_error)
-            continue
-        except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            last_error = f"{provider.__name__} returned an unexpected response."
-            log.warning("%s (%s)", last_error, exc)
-            continue
+
+    while urls_to_try:
+        url = urls_to_try.pop(0)
+
+        for provider in PROVIDERS:
+            try:
+                info = provider(url)
+                if not info.no_watermark_url:
+                    raise ResolveError(f"{info.source_provider}: empty media URL.")
+                _cache_set(info)
+                log.info("Resolved %s via %s", info.video_id, info.source_provider)
+                return info
+            except ResolveError as exc:
+                last_error = str(exc)
+                log.warning("Provider failed: %s", exc)
+                continue
+            except requests.Timeout:
+                last_error = f"{provider.__name__} timed out."
+                log.warning(last_error)
+                continue
+            except requests.RequestException as exc:
+                last_error = f"{provider.__name__} network error: {exc.__class__.__name__}."
+                log.warning(last_error)
+                continue
+            except Exception as exc:  # noqa: BLE001 — a misbehaving provider must never crash the app
+                last_error = f"{provider.__name__} unexpected error: {exc.__class__.__name__}."
+                log.warning("%s (%s)", last_error, exc)
+                continue
+
+        if not tried_manual_resolve and is_short_link(url):
+            tried_manual_resolve = True
+            try:
+                resolved = resolve_short_link(url)
+                if resolved and resolved != url and is_valid_tiktok_url(resolved):
+                    urls_to_try.append(resolved)
+            except Exception as exc:  # noqa: BLE001 — this is a bonus attempt, never fatal
+                log.warning("Manual short-link resolution skipped: %s", exc)
 
     raise ResolveError(
         last_error
@@ -505,7 +684,7 @@ def api_resolve():
         info = resolve_video(raw_url)
     except ResolveError as exc:
         return jsonify(ok=False, error=str(exc)), 422
-    except Exception as exc:  # noqa: BLE001 — last line of defense, never crash
+    except Exception:  # noqa: BLE001 — last line of defense, never crash
         log.exception("Unexpected error resolving %s", raw_url)
         return jsonify(ok=False, error="Something went wrong reading that video. Please try again."), 500
 
@@ -538,7 +717,7 @@ def api_download():
         return jsonify(ok=False, error="Refused to fetch from an untrusted host."), 400
 
     try:
-        upstream = requests.get(
+        upstream = SESSION.get(
             media_url,
             headers={"User-Agent": USER_AGENT, "Referer": "https://www.tiktok.com/"},
             stream=True,
@@ -616,7 +795,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   --bg-0:#eef1f7;
   --bg-1:#e2e7f2;
   --glass:rgba(255,255,255,0.55);
-  --glass-strong:rgba(255,255,255,0.72);
+  --glass-strong:rgba(255,255,255,0.74);
   --glass-border:rgba(255,255,255,0.65);
   --ink-1:#12131a;
   --ink-2:#4a4d5c;
@@ -624,6 +803,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   --accent-1:#7c6cf6;
   --accent-2:#ff6ec4;
   --accent-3:#3ddad7;
+  --accent-4:#ffb84d;
   --danger:#ff5470;
   --success:#2bd576;
   --shadow-lg:0 24px 60px -20px rgba(30,20,70,0.35);
@@ -632,19 +812,20 @@ PAGE_HTML = r"""<!DOCTYPE html>
   --radius-lg:20px;
   --radius-md:14px;
   --radius-sm:10px;
+  --control-h:56px;
   color-scheme: light;
 }
 :root[data-theme="dark"]{
-  --bg-0:#0c0d14;
-  --bg-1:#15172a;
-  --glass:rgba(28,30,46,0.55);
-  --glass-strong:rgba(28,30,46,0.72);
+  --bg-0:#0a0b12;
+  --bg-1:#13152580;
+  --glass:rgba(26,28,44,0.55);
+  --glass-strong:rgba(26,28,44,0.76);
   --glass-border:rgba(255,255,255,0.12);
   --ink-1:#f3f4fa;
   --ink-2:#c3c5da;
   --ink-3:#7f83a0;
-  --shadow-lg:0 24px 70px -20px rgba(0,0,0,0.6);
-  --shadow-sm:0 8px 24px -12px rgba(0,0,0,0.5);
+  --shadow-lg:0 24px 70px -20px rgba(0,0,0,0.65);
+  --shadow-sm:0 8px 24px -12px rgba(0,0,0,0.55);
   color-scheme: dark;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
@@ -655,19 +836,31 @@ body{
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   color:var(--ink-1);
   background:
-    radial-gradient(1200px 800px at 10% -10%, color-mix(in srgb, var(--accent-1) 22%, transparent), transparent),
-    radial-gradient(1000px 700px at 110% 10%, color-mix(in srgb, var(--accent-2) 18%, transparent), transparent),
+    radial-gradient(1200px 800px at 10% -10%, color-mix(in srgb, var(--accent-1) 24%, transparent), transparent),
+    radial-gradient(1000px 700px at 110% 8%, color-mix(in srgb, var(--accent-2) 20%, transparent), transparent),
     radial-gradient(900px 900px at 50% 120%, color-mix(in srgb, var(--accent-3) 16%, transparent), transparent),
+    radial-gradient(700px 600px at 85% 70%, color-mix(in srgb, var(--accent-4) 12%, transparent), transparent),
     linear-gradient(180deg, var(--bg-0), var(--bg-1));
   background-attachment:fixed;
   overflow-x:hidden;
   transition:background-color .4s ease, color .4s ease;
+  -webkit-font-smoothing:antialiased;
 }
-/* ---------- floating glass particles (pure CSS, ambient background) ---------- */
+/* ---------- ambient mesh blobs (pure CSS) ---------- */
+.mesh{position:fixed;inset:0;overflow:hidden;z-index:0;pointer-events:none;filter:blur(2px);}
+.blob{position:absolute;border-radius:50%;opacity:.55;mix-blend-mode:normal;animation:drift 24s ease-in-out infinite;}
+.blob.b1{width:38vmax;height:38vmax;left:-12%;top:-14%;background:radial-gradient(circle at 30% 30%, color-mix(in srgb, var(--accent-1) 55%, transparent), transparent 70%);animation-duration:26s;}
+.blob.b2{width:32vmax;height:32vmax;right:-10%;top:0%;background:radial-gradient(circle at 60% 40%, color-mix(in srgb, var(--accent-2) 50%, transparent), transparent 70%);animation-duration:20s;animation-delay:-6s;}
+.blob.b3{width:30vmax;height:30vmax;left:20%;bottom:-16%;background:radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent-3) 45%, transparent), transparent 70%);animation-duration:30s;animation-delay:-3s;}
+@keyframes drift{
+  0%,100%{transform:translate(0,0) scale(1);}
+  33%{transform:translate(4%,-3%) scale(1.06);}
+  66%{transform:translate(-3%,4%) scale(0.97);}
+}
 .particles{position:fixed;inset:0;overflow:hidden;z-index:0;pointer-events:none;}
 .particle{
   position:absolute;border-radius:50%;
-  background:linear-gradient(135deg, rgba(255,255,255,0.5), rgba(255,255,255,0.05));
+  background:linear-gradient(135deg, rgba(255,255,255,0.55), rgba(255,255,255,0.04));
   backdrop-filter:blur(2px);
   animation:float 18s ease-in-out infinite;
   opacity:.5;
@@ -683,26 +876,27 @@ body{
   66%{transform:translate(-18px,20px) rotate(-6deg);}
 }
 @media (prefers-reduced-motion: reduce){
-  .particle{animation:none;}
+  .particle,.blob{animation:none;}
   *{animation-duration:.001ms !important; transition-duration:.001ms !important;}
 }
 
-.shell{position:relative;z-index:1;max-width:640px;margin:0 auto;padding:28px 20px 60px;min-height:100vh;display:flex;flex-direction:column;}
+.shell{position:relative;z-index:1;max-width:640px;margin:0 auto;padding:clamp(18px,4vw,28px) clamp(14px,4vw,20px) 60px;min-height:100vh;display:flex;flex-direction:column;}
 
 /* ---------- top bar ---------- */
-.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;}
-.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;letter-spacing:-.02em;}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:clamp(20px,5vw,28px);gap:12px;}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:clamp(17px,4vw,19px);letter-spacing:-.02em;min-width:0;}
 .brand .mark{
-  width:34px;height:34px;border-radius:11px;
+  width:38px;height:38px;border-radius:12px;
   background:linear-gradient(135deg,var(--accent-1),var(--accent-2));
   display:flex;align-items:center;justify-content:center;
   box-shadow:var(--shadow-sm);
   flex-shrink:0;
 }
-.brand .mark svg{width:18px;height:18px;}
-.tagline{color:var(--ink-3);font-size:12.5px;margin-top:1px;font-weight:500;}
+.brand .mark svg{width:19px;height:19px;}
+.brand-text{min-width:0;}
+.tagline{color:var(--ink-3);font-size:12px;margin-top:1px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .theme-toggle{
-  width:44px;height:44px;border-radius:50%;
+  width:var(--control-h);height:var(--control-h);border-radius:50%;
   background:var(--glass);
   border:1px solid var(--glass-border);
   backdrop-filter:blur(20px) saturate(160%);
@@ -710,6 +904,7 @@ body{
   display:flex;align-items:center;justify-content:center;
   cursor:pointer;box-shadow:var(--shadow-sm);
   transition:transform .2s ease, box-shadow .2s ease;
+  flex-shrink:0;
 }
 .theme-toggle:hover{transform:translateY(-2px) scale(1.04);}
 .theme-toggle:active{transform:scale(.94);}
@@ -735,40 +930,53 @@ body{
 }
 
 /* ---------- input card ---------- */
-.input-card{padding:22px;margin-bottom:20px;}
-.input-row{display:flex;gap:10px;}
+.input-card{padding:clamp(16px,4vw,22px);margin-bottom:20px;}
+.input-row{display:flex;gap:10px;align-items:stretch;}
 .url-field{
-  flex:1;
+  flex:1;min-width:0;
   display:flex;align-items:center;gap:10px;
   background:color-mix(in srgb, var(--glass-strong) 100%, transparent);
   border:1.5px solid var(--glass-border);
   border-radius:var(--radius-lg);
-  padding:14px 16px;
+  padding:0 16px;
+  height:var(--control-h);
   transition:border-color .2s ease, box-shadow .2s ease;
 }
 .url-field.drag-over{border-color:var(--accent-1); box-shadow:0 0 0 4px color-mix(in srgb, var(--accent-1) 18%, transparent);}
 .url-field svg{width:18px;height:18px;color:var(--ink-3);flex-shrink:0;}
 .url-field input{
-  flex:1;border:none;outline:none;background:transparent;
-  font-size:15.5px;color:var(--ink-1);font-family:inherit;min-width:0;
+  flex:1;min-width:0;border:none;outline:none;background:transparent;
+  font-size:15.5px;color:var(--ink-1);font-family:inherit;height:100%;
 }
 .url-field input::placeholder{color:var(--ink-3);}
+.paste-btn{
+  flex-shrink:0;border:none;cursor:pointer;background:none;
+  width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;
+  color:var(--ink-3);transition:background .15s ease,color .15s ease;
+}
+.paste-btn:hover{background:color-mix(in srgb, var(--ink-1) 8%, transparent);color:var(--ink-1);}
+.paste-btn svg{width:16px;height:16px;}
 .fetch-btn{
   border:none;cursor:pointer;flex-shrink:0;
-  padding:0 22px;border-radius:var(--radius-lg);
+  padding:0 clamp(18px,4vw,24px);border-radius:var(--radius-lg);
   background:linear-gradient(135deg,var(--accent-1),var(--accent-2));
   color:#fff;font-weight:600;font-size:15px;
   box-shadow:0 10px 24px -8px color-mix(in srgb, var(--accent-1) 60%, transparent);
   transition:transform .15s ease, box-shadow .15s ease, opacity .15s ease;
-  display:flex;align-items:center;gap:8px;
-  min-height:52px;line-height:1;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  height:var(--control-h);min-width:104px;white-space:nowrap;
 }
 .fetch-btn svg{width:16px;height:16px;flex-shrink:0;}
+.fetch-btn .spinner{width:16px;height:16px;flex-shrink:0;border-radius:50%;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;animation:spin .7s linear infinite;display:none;}
+.fetch-btn.is-loading .spinner{display:block;}
+.fetch-btn.is-loading svg.arrow{display:none;}
+@keyframes spin{to{transform:rotate(360deg);}}
 .fetch-btn:hover{transform:translateY(-2px);}
 .fetch-btn:active{transform:translateY(0) scale(.97);}
-.fetch-btn:disabled{opacity:.6;cursor:not-allowed;transform:none;}
-.hint-row{display:flex;align-items:center;justify-content:space-between;margin-top:10px;padding:0 2px;}
-.hint{font-size:12px;color:var(--ink-3);}
+.fetch-btn:disabled{opacity:.7;cursor:not-allowed;transform:none;}
+.hint-row{display:flex;align-items:center;justify-content:space-between;margin-top:10px;padding:0 2px;gap:8px;}
+.hint{font-size:11.5px;color:var(--ink-3);}
+.hint.hide-mobile{display:inline;}
 .kbd{
   display:inline-flex;align-items:center;justify-content:center;
   font-size:10.5px;padding:2px 6px;border-radius:6px;
@@ -801,8 +1009,8 @@ body{
 @keyframes fade-up{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:translateY(0);}}
 
 /* empty state */
-.empty{padding:56px 28px;text-align:center;}
-.empty svg{width:120px;height:120px;margin:0 auto 18px;display:block;}
+.empty{padding:clamp(36px,8vw,56px) clamp(18px,6vw,28px);text-align:center;}
+.empty svg{width:120px;height:120px;margin:0 auto 18px;display:block;max-width:100%;height:auto;}
 .empty h3{margin:0 0 6px;font-size:17px;font-weight:700;}
 .empty p{margin:0;color:var(--ink-3);font-size:13.5px;line-height:1.5;}
 
@@ -811,14 +1019,14 @@ body{
 .sk{border-radius:var(--radius-md);background:linear-gradient(100deg, color-mix(in srgb, var(--ink-1) 6%, transparent) 8%, color-mix(in srgb, var(--ink-1) 12%, transparent) 18%, color-mix(in srgb, var(--ink-1) 6%, transparent) 33%);background-size:200% 100%;animation:shimmer 1.4s ease infinite;}
 @keyframes shimmer{0%{background-position:200% 0;}100%{background-position:-200% 0;}}
 .sk-thumb{width:110px;height:150px;flex-shrink:0;}
-.sk-lines{flex:1;display:flex;flex-direction:column;gap:10px;padding-top:6px;}
+.sk-lines{flex:1;display:flex;flex-direction:column;gap:10px;padding-top:6px;min-width:0;}
 .sk-line{height:12px;border-radius:6px;}
 .sk-line.w60{width:60%;}
 .sk-line.w40{width:40%;}
 .sk-line.w80{width:80%;}
 
 /* preview card */
-.preview-card{padding:20px;}
+.preview-card{padding:clamp(16px,4vw,20px);}
 .preview-top{display:flex;gap:16px;}
 .thumb-wrap{position:relative;width:110px;height:150px;flex-shrink:0;border-radius:var(--radius-md);overflow:hidden;box-shadow:var(--shadow-sm);background:color-mix(in srgb, var(--ink-1) 8%, transparent);}
 .thumb-wrap img{width:100%;height:100%;object-fit:cover;display:block;}
@@ -829,8 +1037,9 @@ body{
 .thumb-wrap .play-badge:hover svg{opacity:1;}
 .meta{flex:1;min-width:0;display:flex;flex-direction:column;}
 .meta .title{font-size:14.5px;font-weight:650;line-height:1.35;margin:0 0 6px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;}
-.meta .author{font-size:12.5px;color:var(--ink-3);margin:0 0 10px;display:flex;align-items:center;gap:6px;}
-.meta .author .avatar-dot{width:6px;height:6px;border-radius:50%;background:linear-gradient(135deg,var(--accent-1),var(--accent-3));}
+.meta .author{font-size:12.5px;color:var(--ink-3);margin:0 0 10px;display:flex;align-items:center;gap:6px;min-width:0;}
+.meta .author span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.meta .author .avatar-dot{width:6px;height:6px;border-radius:50%;background:linear-gradient(135deg,var(--accent-1),var(--accent-3));flex-shrink:0;}
 .pill-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:auto;}
 .pill{
   font-size:11px;font-weight:600;padding:4px 9px;border-radius:20px;
@@ -850,7 +1059,7 @@ body{
 }
 .btn:active{transform:scale(.97);}
 .btn-primary{
-  flex:1;min-width:170px;color:#fff;
+  flex:1 1 170px;min-width:0;color:#fff;
   background:linear-gradient(135deg,var(--accent-1),var(--accent-2));
   box-shadow:0 12px 26px -10px color-mix(in srgb, var(--accent-1) 60%, transparent);
 }
@@ -865,7 +1074,7 @@ body{
 
 /* progress */
 .progress-wrap{margin-top:16px;}
-.progress-head{display:flex;justify-content:space-between;font-size:12.5px;color:var(--ink-2);margin-bottom:8px;font-weight:600;}
+.progress-head{display:flex;justify-content:space-between;font-size:12.5px;color:var(--ink-2);margin-bottom:8px;font-weight:600;gap:8px;}
 .progress-track{height:10px;border-radius:20px;background:color-mix(in srgb, var(--ink-1) 8%, transparent);overflow:hidden;position:relative;}
 .progress-fill{
   height:100%;border-radius:20px;width:0%;
@@ -875,7 +1084,7 @@ body{
   transition:width .25s ease;
 }
 @keyframes progress-flow{0%{background-position:0% 0;}100%{background-position:200% 0;}}
-.progress-sub{margin-top:8px;font-size:11.5px;color:var(--ink-3);display:flex;justify-content:space-between;}
+.progress-sub{margin-top:8px;font-size:11.5px;color:var(--ink-3);display:flex;justify-content:space-between;gap:8px;}
 
 /* success */
 .success-box{padding:26px 20px;text-align:center;}
@@ -889,7 +1098,7 @@ body{
 @keyframes pop{0%{transform:scale(0);}70%{transform:scale(1.12);}100%{transform:scale(1);}}
 .success-icon svg{width:30px;height:30px;color:#fff;}
 .success-box h3{margin:0 0 4px;font-size:16.5px;font-weight:700;}
-.success-box p{margin:0 0 18px;color:var(--ink-3);font-size:13px;}
+.success-box p{margin:0 0 18px;color:var(--ink-3);font-size:13px;word-break:break-word;}
 
 /* history */
 .history-card{padding:18px 20px;margin-top:20px;}
@@ -915,17 +1124,23 @@ footer{margin-top:auto;padding-top:36px;text-align:center;}
   background:var(--glass);border:1px solid var(--glass-border);
   backdrop-filter:blur(20px) saturate(160%);-webkit-backdrop-filter:blur(20px) saturate(160%);
   font-size:11.5px;color:var(--ink-3);font-weight:500;box-shadow:var(--shadow-sm);
+  max-width:100%;
 }
 .footer-pill b{color:var(--ink-2);font-weight:700;}
 .footer-pill .heart{color:var(--accent-2);}
 
+@media (max-width:640px){
+  .hint.hide-mobile{display:none;}
+}
 @media (max-width:480px){
-  .shell{padding:18px 14px 40px;}
-  .input-row{flex-direction:column;}
-  .fetch-btn{padding:14px;justify-content:center;}
+  .shell{padding:16px 12px 40px;}
   .preview-top{flex-direction:column;}
   .thumb-wrap{width:100%;height:220px;}
-  .gate-card{padding:24px 18px 20px;}
+  .gate-card{padding:22px 18px 18px;}
+}
+@media (max-width:360px){
+  .input-row{flex-direction:column;}
+  .fetch-btn{width:100%;}
 }
 :focus-visible{outline:2.5px solid var(--accent-1);outline-offset:2px;}
 
@@ -935,11 +1150,12 @@ footer{margin-top:auto;padding-top:36px;text-align:center;}
   display:flex;align-items:center;justify-content:center;
   padding:20px;
   background:
-    radial-gradient(900px 700px at 20% 0%, color-mix(in srgb, var(--accent-1) 30%, transparent), transparent),
-    radial-gradient(800px 700px at 100% 100%, color-mix(in srgb, var(--accent-2) 22%, transparent), transparent),
-    color-mix(in srgb, var(--bg-0) 88%, black 12%);
-  backdrop-filter:blur(6px);
-  -webkit-backdrop-filter:blur(6px);
+    radial-gradient(900px 700px at 20% 0%, color-mix(in srgb, var(--accent-1) 32%, transparent), transparent),
+    radial-gradient(800px 700px at 100% 100%, color-mix(in srgb, var(--accent-2) 24%, transparent), transparent),
+    radial-gradient(700px 600px at 60% 90%, color-mix(in srgb, var(--accent-3) 16%, transparent), transparent),
+    color-mix(in srgb, var(--bg-0) 86%, black 14%);
+  backdrop-filter:blur(8px);
+  -webkit-backdrop-filter:blur(8px);
   animation:gate-fade-in .35s ease;
 }
 .gate-overlay.hidden{display:none;}
@@ -949,33 +1165,47 @@ footer{margin-top:auto;padding-top:36px;text-align:center;}
 body.gate-locked{overflow:hidden;}
 
 .gate-card{
-  width:100%;max-width:380px;
+  width:100%;max-width:390px;
   background:var(--glass-strong);
   border:1px solid var(--glass-border);
-  backdrop-filter:blur(30px) saturate(180%);
-  -webkit-backdrop-filter:blur(30px) saturate(180%);
+  backdrop-filter:blur(34px) saturate(190%);
+  -webkit-backdrop-filter:blur(34px) saturate(190%);
   border-radius:var(--radius-xl);
   box-shadow:var(--shadow-lg);
-  padding:28px 24px 24px;
+  padding:30px 26px 26px;
   text-align:center;
   position:relative;
   animation:gate-pop .45s cubic-bezier(.2,.9,.3,1.2);
+  overflow:hidden;
+}
+.gate-card::before{
+  content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg, rgba(255,255,255,.85), rgba(255,255,255,0) 45%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor; mask-composite:exclude;
+  pointer-events:none;
 }
 @keyframes gate-pop{from{opacity:0;transform:translateY(16px) scale(.96);}to{opacity:1;transform:translateY(0) scale(1);}}
-.gate-icon{
-  width:64px;height:64px;border-radius:20px;margin:0 auto 16px;
+.gate-icon-ring{
+  width:78px;height:78px;border-radius:24px;margin:0 auto 18px;position:relative;
   background:linear-gradient(135deg,#1877f2,#42a5f5);
   display:flex;align-items:center;justify-content:center;
-  box-shadow:0 14px 30px -10px rgba(24,119,242,0.55);
+  box-shadow:0 16px 34px -10px rgba(24,119,242,0.55);
 }
-.gate-icon svg{width:32px;height:32px;color:#fff;}
-.gate-card h3{margin:0 0 8px;font-size:18px;font-weight:750;letter-spacing:-.01em;}
+.gate-icon-ring::after{
+  content:"";position:absolute;inset:-6px;border-radius:28px;
+  border:2px solid rgba(24,119,242,.35);
+  animation:ring-pulse 2.2s ease-out infinite;
+}
+@keyframes ring-pulse{0%{transform:scale(.9);opacity:.9;}100%{transform:scale(1.25);opacity:0;}}
+.gate-icon-ring svg{width:34px;height:34px;color:#fff;}
+.gate-card h3{margin:0 0 8px;font-size:18.5px;font-weight:750;letter-spacing:-.01em;}
 .gate-card p{margin:0 0 20px;color:var(--ink-2);font-size:13.5px;line-height:1.55;}
 .gate-step{display:none;}
 .gate-step.active{display:block;animation:fade-up .3s ease;}
 .gate-follow-btn{
   display:flex;align-items:center;justify-content:center;gap:9px;
-  width:100%;padding:14px 18px;border-radius:var(--radius-lg);
+  width:100%;padding:15px 18px;border-radius:var(--radius-lg);
   background:linear-gradient(135deg,#1877f2,#3b8ef2);
   color:#fff;font-weight:700;font-size:15px;text-decoration:none;
   box-shadow:0 12px 26px -10px rgba(24,119,242,0.55);
@@ -994,16 +1224,21 @@ body.gate-locked{overflow:hidden;}
 }
 .gate-check-row input{margin-top:2px;width:17px;height:17px;flex-shrink:0;accent-color:var(--accent-1);cursor:pointer;}
 .gate-check-row span{font-size:13px;color:var(--ink-1);line-height:1.4;}
+
 .gate-continue-btn{
-  width:100%;padding:14px 18px;border-radius:var(--radius-lg);
-  border:none;font-weight:700;font-size:15px;cursor:pointer;
+  width:100%;padding:0 18px;height:52px;border-radius:var(--radius-lg);
+  border:none;font-weight:700;font-size:15px;cursor:pointer;position:relative;overflow:hidden;
   background:linear-gradient(135deg,var(--accent-1),var(--accent-2));
   color:#fff;box-shadow:0 12px 26px -10px color-mix(in srgb, var(--accent-1) 60%, transparent);
   transition:transform .15s ease, opacity .15s ease;
-  display:flex;align-items:center;justify-content:center;gap:8px;
+  display:flex;align-items:center;justify-content:center;gap:10px;
 }
 .gate-continue-btn:hover:not(:disabled){transform:translateY(-2px);}
-.gate-continue-btn:disabled{opacity:.5;cursor:not-allowed;}
+.gate-continue-btn:disabled{opacity:.55;cursor:not-allowed;}
+.gate-ring{width:20px;height:20px;flex-shrink:0;transform:rotate(-90deg);}
+.gate-ring circle{fill:none;stroke-width:3;}
+.gate-ring .track{stroke:rgba(255,255,255,.3);}
+.gate-ring .prog{stroke:#fff;stroke-linecap:round;transition:stroke-dashoffset .3s linear;}
 .gate-fallback{
   display:none;margin-top:16px;font-size:11.5px;color:var(--ink-3);
   background:none;border:none;text-decoration:underline;cursor:pointer;
@@ -1017,7 +1252,7 @@ body.gate-locked{overflow:hidden;}
   <div class="gate-card">
 
     <div class="gate-step active" id="gateStepFollow">
-      <div class="gate-icon">
+      <div class="gate-icon-ring">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M22 12a10 10 0 1 0-11.6 9.9v-7H7.9V12h2.5V9.8c0-2.5 1.5-3.9 3.8-3.9 1.1 0 2.2.2 2.2.2v2.5h-1.3c-1.2 0-1.6.8-1.6 1.6V12h2.8l-.4 2.9h-2.4v7A10 10 0 0 0 22 12z"/></svg>
       </div>
       <h3 id="gateTitle">One quick thing first</h3>
@@ -1030,7 +1265,7 @@ body.gate-locked{overflow:hidden;}
     </div>
 
     <div class="gate-step" id="gateStepConfirm">
-      <div class="gate-icon" style="background:linear-gradient(135deg,var(--success),#1fb968);box-shadow:0 14px 30px -10px color-mix(in srgb, var(--success) 55%, transparent);">
+      <div class="gate-icon-ring" style="background:linear-gradient(135deg,var(--success),#1fb968);box-shadow:0 14px 30px -10px color-mix(in srgb, var(--success) 55%, transparent);">
         <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
       </div>
       <h3>Thanks for stopping by!</h3>
@@ -1040,6 +1275,7 @@ body.gate-locked{overflow:hidden;}
         <span>Yes, I followed the GlassTok Facebook page</span>
       </label>
       <button class="gate-continue-btn" id="gateContinueBtn" disabled>
+        <svg class="gate-ring" id="gateRing" viewBox="0 0 24 24"><circle class="track" cx="12" cy="12" r="10"/><circle class="prog" id="gateRingProg" cx="12" cy="12" r="10"/></svg>
         <span id="gateContinueLabel">Continue in 5s…</span>
       </button>
       <button class="gate-fallback" id="gateFallbackBtn">Having trouble? Continue anyway</button>
@@ -1048,6 +1284,9 @@ body.gate-locked{overflow:hidden;}
   </div>
 </div>
 
+<div class="mesh" aria-hidden="true">
+  <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+</div>
 <div class="particles" aria-hidden="true">
   <div class="particle"></div><div class="particle"></div><div class="particle"></div>
   <div class="particle"></div><div class="particle"></div>
@@ -1058,15 +1297,13 @@ body.gate-locked{overflow:hidden;}
 <div class="shell">
 
   <div class="topbar">
-    <div>
-      <div class="brand">
-        <span class="mark">
-          <svg viewBox="0 0 24 24" fill="none"><path d="M16 3v9.5a4.5 4.5 0 1 1-3-4.24V3h3z" fill="#fff"/><path d="M16 3c.3 2.2 1.9 3.9 4 4.2V10c-1.5-.1-2.9-.6-4-1.5V3z" fill="#fff" opacity=".7"/></svg>
-        </span>
-        <div>
-          GlassTok
-          <div class="tagline">TikTok, without the watermark.</div>
-        </div>
+    <div class="brand">
+      <span class="mark">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M16 3v9.5a4.5 4.5 0 1 1-3-4.24V3h3z" fill="#fff"/><path d="M16 3c.3 2.2 1.9 3.9 4 4.2V10c-1.5-.1-2.9-.6-4-1.5V3z" fill="#fff" opacity=".7"/></svg>
+      </span>
+      <div class="brand-text">
+        GlassTok
+        <div class="tagline">TikTok, without the watermark.</div>
       </div>
     </div>
     <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark mode" title="Toggle theme">
@@ -1080,16 +1317,20 @@ body.gate-locked{overflow:hidden;}
       <div class="url-field" id="urlField">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.07 0l2.83-2.83a5 5 0 0 0-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.07 0L4.1 13.83a5 5 0 0 0 7.07 7.07l1.5-1.5"/></svg>
         <input id="urlInput" type="url" inputmode="url" autocomplete="off" spellcheck="false"
-               placeholder="Paste a TikTok link… (Ctrl+V)" aria-label="TikTok video URL" />
+               placeholder="Paste a TikTok link…" aria-label="TikTok video URL" />
+        <button class="paste-btn" id="pasteBtn" type="button" title="Paste from clipboard" aria-label="Paste from clipboard">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M9 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-3"/></svg>
+        </button>
       </div>
       <button class="fetch-btn" id="fetchBtn" aria-label="Fetch video">
+        <span class="spinner"></span>
         <span id="fetchBtnLabel">Fetch</span>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        <svg class="arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
       </button>
     </div>
     <div class="hint-row">
-      <span class="hint">Works with tiktok.com, vm.tiktok.com &amp; vt.tiktok.com links</span>
-      <span class="hint"><span class="kbd">Enter</span> to fetch</span>
+      <span class="hint hide-mobile">Works with tiktok.com, vm/vt short links &amp; the app's Share sheet</span>
+      <span class="hint">Any link, any device</span>
     </div>
   </div>
 
@@ -1235,6 +1476,7 @@ body.gate-locked{overflow:hidden;}
     const GATE_KEY = "glasstok_fb_gate_passed";
     const CONTINUE_DELAY_MS = 5000;
     const FALLBACK_DELAY_MS = 20000;
+    const RING_R = 10, RING_C = 2 * Math.PI * RING_R;
 
     const overlay = document.getElementById("gateOverlay");
     const stepFollow = document.getElementById("gateStepFollow");
@@ -1243,7 +1485,13 @@ body.gate-locked{overflow:hidden;}
     const checkbox = document.getElementById("gateCheckbox");
     const continueBtn = document.getElementById("gateContinueBtn");
     const continueLabel = document.getElementById("gateContinueLabel");
+    const ringProg = document.getElementById("gateRingProg");
     const fallbackBtn = document.getElementById("gateFallbackBtn");
+
+    if (ringProg) {
+      ringProg.style.strokeDasharray = String(RING_C);
+      ringProg.style.strokeDashoffset = "0";
+    }
 
     let alreadyPassed = false;
     try { alreadyPassed = localStorage.getItem(GATE_KEY) === "true"; } catch (e) {}
@@ -1277,19 +1525,26 @@ body.gate-locked{overflow:hidden;}
       stepFollow.classList.remove("active");
       stepConfirm.classList.add("active");
 
-      let secondsLeft = Math.ceil(CONTINUE_DELAY_MS / 1000);
-      continueLabel.textContent = `Continue in ${secondsLeft}s…`;
-      const tick = setInterval(() => {
-        secondsLeft -= 1;
-        if (secondsLeft <= 0) {
-          clearInterval(tick);
+      const totalMs = CONTINUE_DELAY_MS;
+      const startedAt = performance.now();
+      continueLabel.textContent = `Continue in ${Math.ceil(totalMs / 1000)}s…`;
+
+      function tick() {
+        const elapsed = performance.now() - startedAt;
+        const remaining = Math.max(0, totalMs - elapsed);
+        const frac = remaining / totalMs;
+        if (ringProg) ringProg.style.strokeDashoffset = String(RING_C * frac);
+
+        if (remaining <= 0) {
           timerDone = true;
           continueLabel.textContent = "Continue to GlassTok";
           evaluateContinueState();
-        } else {
-          continueLabel.textContent = `Continue in ${secondsLeft}s…`;
+          return;
         }
-      }, 1000);
+        continueLabel.textContent = `Continue in ${Math.ceil(remaining / 1000)}s…`;
+        requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);
 
       // Absolute safety net: never let someone be stuck here indefinitely,
       // even if the checkbox/timer UI misbehaves on some device.
@@ -1377,6 +1632,7 @@ body.gate-locked{overflow:hidden;}
   // ---------------------------------------------------------------------
   const urlField = document.getElementById("urlField");
   const urlInput = document.getElementById("urlInput");
+  const pasteBtn = document.getElementById("pasteBtn");
   const fetchBtn = document.getElementById("fetchBtn");
   const fetchBtnLabel = document.getElementById("fetchBtnLabel");
 
@@ -1411,6 +1667,29 @@ body.gate-locked{overflow:hidden;}
   let currentVideo = null;   // last resolved video payload from /api/resolve
   let history = [];          // session-only history (never persisted)
 
+  // Only show the clipboard-paste button on browsers that actually support
+  // navigator.clipboard.readText with a real permission prompt (mostly
+  // desktop Chrome/Edge + some Android WebViews). On unsupported browsers
+  // (notably iOS Safari, which requires the paste to originate from a
+  // native context menu) we just hide it — the input still accepts a
+  // normal long-press-paste from the OS keyboard either way.
+  if (!(navigator.clipboard && navigator.clipboard.readText)) {
+    pasteBtn.style.display = "none";
+  }
+  pasteBtn.addEventListener("click", async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        urlInput.value = text;
+        resolveUrl(text);
+      } else {
+        toast("Clipboard is empty.", "info", 2000);
+      }
+    } catch (e) {
+      toast("Couldn't read the clipboard — paste manually instead.", "error");
+    }
+  });
+
   // ---------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------
@@ -1443,7 +1722,9 @@ body.gate-locked{overflow:hidden;}
 
     showState("loading");
     fetchBtn.disabled = true;
-    fetchBtnLabel.textContent = isRetry ? "Waking up server…" : "Fetching…";
+    fetchBtn.classList.add("is-loading");
+    fetchBtnLabel.textContent = "Fetching…";
+    if (isRetry) toast("Server is waking up — hang tight a moment…", "info", 2500);
 
     try {
       const res = await fetch("/api/resolve", {
@@ -1484,6 +1765,7 @@ body.gate-locked{overflow:hidden;}
       toast(err.message || "Something went wrong.", "error");
     } finally {
       fetchBtn.disabled = false;
+      fetchBtn.classList.remove("is-loading");
       fetchBtnLabel.textContent = "Fetch";
     }
   }
