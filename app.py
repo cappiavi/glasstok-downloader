@@ -761,7 +761,9 @@ body{
   box-shadow:0 10px 24px -8px color-mix(in srgb, var(--accent-1) 60%, transparent);
   transition:transform .15s ease, box-shadow .15s ease, opacity .15s ease;
   display:flex;align-items:center;gap:8px;
+  min-height:52px;line-height:1;
 }
+.fetch-btn svg{width:16px;height:16px;flex-shrink:0;}
 .fetch-btn:hover{transform:translateY(-2px);}
 .fetch-btn:active{transform:translateY(0) scale(.97);}
 .fetch-btn:disabled{opacity:.6;cursor:not-allowed;transform:none;}
@@ -923,11 +925,128 @@ footer{margin-top:auto;padding-top:36px;text-align:center;}
   .fetch-btn{padding:14px;justify-content:center;}
   .preview-top{flex-direction:column;}
   .thumb-wrap{width:100%;height:220px;}
+  .gate-card{padding:24px 18px 20px;}
 }
 :focus-visible{outline:2.5px solid var(--accent-1);outline-offset:2px;}
+
+/* ---------- Follow gate ---------- */
+.gate-overlay{
+  position:fixed;inset:0;z-index:2000;
+  display:flex;align-items:center;justify-content:center;
+  padding:20px;
+  background:
+    radial-gradient(900px 700px at 20% 0%, color-mix(in srgb, var(--accent-1) 30%, transparent), transparent),
+    radial-gradient(800px 700px at 100% 100%, color-mix(in srgb, var(--accent-2) 22%, transparent), transparent),
+    color-mix(in srgb, var(--bg-0) 88%, black 12%);
+  backdrop-filter:blur(6px);
+  -webkit-backdrop-filter:blur(6px);
+  animation:gate-fade-in .35s ease;
+}
+.gate-overlay.hidden{display:none;}
+.gate-overlay.closing{animation:gate-fade-out .35s ease forwards;}
+@keyframes gate-fade-in{from{opacity:0;}to{opacity:1;}}
+@keyframes gate-fade-out{from{opacity:1;}to{opacity:0;visibility:hidden;}}
+body.gate-locked{overflow:hidden;}
+
+.gate-card{
+  width:100%;max-width:380px;
+  background:var(--glass-strong);
+  border:1px solid var(--glass-border);
+  backdrop-filter:blur(30px) saturate(180%);
+  -webkit-backdrop-filter:blur(30px) saturate(180%);
+  border-radius:var(--radius-xl);
+  box-shadow:var(--shadow-lg);
+  padding:28px 24px 24px;
+  text-align:center;
+  position:relative;
+  animation:gate-pop .45s cubic-bezier(.2,.9,.3,1.2);
+}
+@keyframes gate-pop{from{opacity:0;transform:translateY(16px) scale(.96);}to{opacity:1;transform:translateY(0) scale(1);}}
+.gate-icon{
+  width:64px;height:64px;border-radius:20px;margin:0 auto 16px;
+  background:linear-gradient(135deg,#1877f2,#42a5f5);
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 14px 30px -10px rgba(24,119,242,0.55);
+}
+.gate-icon svg{width:32px;height:32px;color:#fff;}
+.gate-card h3{margin:0 0 8px;font-size:18px;font-weight:750;letter-spacing:-.01em;}
+.gate-card p{margin:0 0 20px;color:var(--ink-2);font-size:13.5px;line-height:1.55;}
+.gate-step{display:none;}
+.gate-step.active{display:block;animation:fade-up .3s ease;}
+.gate-follow-btn{
+  display:flex;align-items:center;justify-content:center;gap:9px;
+  width:100%;padding:14px 18px;border-radius:var(--radius-lg);
+  background:linear-gradient(135deg,#1877f2,#3b8ef2);
+  color:#fff;font-weight:700;font-size:15px;text-decoration:none;
+  box-shadow:0 12px 26px -10px rgba(24,119,242,0.55);
+  border:none;cursor:pointer;transition:transform .15s ease;
+}
+.gate-follow-btn:hover{transform:translateY(-2px);}
+.gate-follow-btn:active{transform:translateY(0) scale(.97);}
+.gate-follow-btn svg{width:18px;height:18px;flex-shrink:0;}
+.gate-note{margin-top:14px;font-size:11.5px;color:var(--ink-3);}
+
+.gate-check-row{
+  display:flex;align-items:flex-start;gap:10px;text-align:left;
+  background:color-mix(in srgb, var(--ink-1) 5%, transparent);
+  border:1px solid var(--glass-border);border-radius:var(--radius-md);
+  padding:12px 14px;margin-bottom:18px;cursor:pointer;
+}
+.gate-check-row input{margin-top:2px;width:17px;height:17px;flex-shrink:0;accent-color:var(--accent-1);cursor:pointer;}
+.gate-check-row span{font-size:13px;color:var(--ink-1);line-height:1.4;}
+.gate-continue-btn{
+  width:100%;padding:14px 18px;border-radius:var(--radius-lg);
+  border:none;font-weight:700;font-size:15px;cursor:pointer;
+  background:linear-gradient(135deg,var(--accent-1),var(--accent-2));
+  color:#fff;box-shadow:0 12px 26px -10px color-mix(in srgb, var(--accent-1) 60%, transparent);
+  transition:transform .15s ease, opacity .15s ease;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+}
+.gate-continue-btn:hover:not(:disabled){transform:translateY(-2px);}
+.gate-continue-btn:disabled{opacity:.5;cursor:not-allowed;}
+.gate-fallback{
+  display:none;margin-top:16px;font-size:11.5px;color:var(--ink-3);
+  background:none;border:none;text-decoration:underline;cursor:pointer;
+}
+.gate-fallback.show{display:inline-block;}
 </style>
 </head>
 <body>
+
+<div class="gate-overlay" id="gateOverlay" role="dialog" aria-modal="true" aria-labelledby="gateTitle">
+  <div class="gate-card">
+
+    <div class="gate-step active" id="gateStepFollow">
+      <div class="gate-icon">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M22 12a10 10 0 1 0-11.6 9.9v-7H7.9V12h2.5V9.8c0-2.5 1.5-3.9 3.8-3.9 1.1 0 2.2.2 2.2.2v2.5h-1.3c-1.2 0-1.6.8-1.6 1.6V12h2.8l-.4 2.9h-2.4v7A10 10 0 0 0 22 12z"/></svg>
+      </div>
+      <h3 id="gateTitle">One quick thing first</h3>
+      <p>Give the GlassTok Facebook page a follow to unlock the downloader — it keeps this tool free and running.</p>
+      <a class="gate-follow-btn" id="gateFollowBtn" href="https://www.facebook.com/dr.khertmd.em/" target="_blank" rel="noopener noreferrer">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M22 12a10 10 0 1 0-11.6 9.9v-7H7.9V12h2.5V9.8c0-2.5 1.5-3.9 3.8-3.9 1.1 0 2.2.2 2.2.2v2.5h-1.3c-1.2 0-1.6.8-1.6 1.6V12h2.8l-.4 2.9h-2.4v7A10 10 0 0 0 22 12z"/></svg>
+        Follow on Facebook
+      </a>
+      <div class="gate-note">Opens in a new tab — come back here after.</div>
+    </div>
+
+    <div class="gate-step" id="gateStepConfirm">
+      <div class="gate-icon" style="background:linear-gradient(135deg,var(--success),#1fb968);box-shadow:0 14px 30px -10px color-mix(in srgb, var(--success) 55%, transparent);">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+      </div>
+      <h3>Thanks for stopping by!</h3>
+      <p>Confirm you followed the page and you're in.</p>
+      <label class="gate-check-row" for="gateCheckbox">
+        <input type="checkbox" id="gateCheckbox" />
+        <span>Yes, I followed the GlassTok Facebook page</span>
+      </label>
+      <button class="gate-continue-btn" id="gateContinueBtn" disabled>
+        <span id="gateContinueLabel">Continue in 5s…</span>
+      </button>
+      <button class="gate-fallback" id="gateFallbackBtn">Having trouble? Continue anyway</button>
+    </div>
+
+  </div>
+</div>
 
 <div class="particles" aria-hidden="true">
   <div class="particle"></div><div class="particle"></div><div class="particle"></div>
@@ -1103,6 +1222,86 @@ footer{margin-top:auto;padding-top:36px;text-align:center;}
 <script>
 (() => {
   "use strict";
+
+  // ---------------------------------------------------------------------
+  // Follow gate — blocks use of the app until the person has (a) opened
+  // the Facebook page and (b) confirmed + waited out a short timer.
+  // We can't cryptographically verify a "follow" without Facebook OAuth
+  // (which this project intentionally avoids), so this is an honest,
+  // honor-system gate: real friction, not fake verification. It never
+  // permanently traps anyone — a de-emphasized fallback always appears.
+  // ---------------------------------------------------------------------
+  (function initFollowGate() {
+    const GATE_KEY = "glasstok_fb_gate_passed";
+    const CONTINUE_DELAY_MS = 5000;
+    const FALLBACK_DELAY_MS = 20000;
+
+    const overlay = document.getElementById("gateOverlay");
+    const stepFollow = document.getElementById("gateStepFollow");
+    const stepConfirm = document.getElementById("gateStepConfirm");
+    const followBtn = document.getElementById("gateFollowBtn");
+    const checkbox = document.getElementById("gateCheckbox");
+    const continueBtn = document.getElementById("gateContinueBtn");
+    const continueLabel = document.getElementById("gateContinueLabel");
+    const fallbackBtn = document.getElementById("gateFallbackBtn");
+
+    let alreadyPassed = false;
+    try { alreadyPassed = localStorage.getItem(GATE_KEY) === "true"; } catch (e) {}
+
+    if (alreadyPassed) {
+      overlay.classList.add("hidden");
+      return;
+    }
+
+    document.body.classList.add("gate-locked");
+    let timerDone = false;
+
+    function evaluateContinueState() {
+      continueBtn.disabled = !(timerDone && checkbox.checked);
+    }
+
+    function closeGate() {
+      try { localStorage.setItem(GATE_KEY, "true"); } catch (e) {}
+      document.body.classList.remove("gate-locked");
+      overlay.classList.add("closing");
+      setTimeout(() => overlay.classList.add("hidden"), 350);
+      const urlInputEl = document.getElementById("urlInput");
+      if (urlInputEl) setTimeout(() => urlInputEl.focus(), 400);
+    }
+
+    followBtn.addEventListener("click", () => {
+      // The <a> tag's own href+target already opens the Facebook page in a
+      // new tab natively (more reliable than window.open across mobile
+      // browsers, since it's a direct user-gesture navigation rather than
+      // a script-initiated popup that some browsers block).
+      stepFollow.classList.remove("active");
+      stepConfirm.classList.add("active");
+
+      let secondsLeft = Math.ceil(CONTINUE_DELAY_MS / 1000);
+      continueLabel.textContent = `Continue in ${secondsLeft}s…`;
+      const tick = setInterval(() => {
+        secondsLeft -= 1;
+        if (secondsLeft <= 0) {
+          clearInterval(tick);
+          timerDone = true;
+          continueLabel.textContent = "Continue to GlassTok";
+          evaluateContinueState();
+        } else {
+          continueLabel.textContent = `Continue in ${secondsLeft}s…`;
+        }
+      }, 1000);
+
+      // Absolute safety net: never let someone be stuck here indefinitely,
+      // even if the checkbox/timer UI misbehaves on some device.
+      setTimeout(() => fallbackBtn.classList.add("show"), FALLBACK_DELAY_MS);
+    });
+
+    checkbox.addEventListener("change", evaluateContinueState);
+    continueBtn.addEventListener("click", () => {
+      if (!continueBtn.disabled) closeGate();
+    });
+    fallbackBtn.addEventListener("click", closeGate);
+  })();
 
   // ---------------------------------------------------------------------
   // Theme
